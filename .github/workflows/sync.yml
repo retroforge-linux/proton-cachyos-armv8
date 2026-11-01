@@ -33,14 +33,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
+          released() {  # a published release (a draft is a failed upload: built again)
+            [ "$(gh release view "$1" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" = false ]
+          }
           tag=$INPUT_TAG
           if [ -z "$tag" ]; then
             tag=$(gh api --paginate 'repos/CachyOS/proton-cachyos/releases?per_page=100' \
                     --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
                   grep -E '^cachyos-[0-9]+\.[0-9]+-[0-9]{8}-slr$' | sort -V | tail -1)
-            if [ -n "$tag" ] && gh release view "$tag-armv8" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ -n "$tag" ] && released "$tag-armv8"; then
               tag=
             fi
+          fi
+          # A dispatch for a tag already released here: nothing to build.
+          if [ -n "$tag" ] && [ -n "$INPUT_TAG" ] && released "$tag-armv8"; then
+            echo "release $tag-armv8 exists already" >&2
+            tag=
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
@@ -95,16 +103,22 @@ jobs:
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # A draft until every file is uploaded: a release that exists is a complete one, so the plan
+        # job may skip its tag. A draft left by a failed upload is deleted and made again.
         run: |
           f="$RUNNER_TEMP/work/proton-$TAG-armv8.tar.zst"
-          gh release create "$TAG-armv8" --title "Proton-CachyOS ${TAG#cachyos-} (ARMv8.0)" \
+          gh release delete "$TAG-armv8" --yes 2>/dev/null || true
+          gh release create "$TAG-armv8" --draft --title "Proton-CachyOS ${TAG#cachyos-} (ARMv8.0)" \
             --notes "Proton-CachyOS's [\`$TAG\`](https://github.com/CachyOS/proton-cachyos/releases/tag/$TAG) arm64 build, for ARMv8.0 CPUs (no LSE atomics): \`-march=armv8-a\`, and no inline LSE/RCpc in its arm64 binaries. Extract into \`compatibilitytools.d\`." \
             "$f" "$f.sha256" "$f.sha512"
+          gh release edit "$TAG-armv8" --draft=false
 
       - name: Report failure
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           title="Build failed: $TAG"
           gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number' | grep -q . ||
