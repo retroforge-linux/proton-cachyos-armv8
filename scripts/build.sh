@@ -4,7 +4,7 @@
 #   build.sh <tag> <workdir>    a Proton-CachyOS release tag, e.g. cachyos-11.0-20261015-slr
 #
 # Produces <workdir>/proton-<tag>-armv8.tar.zst with .sha256 and .sha512 next to it.
-# Needs git, make, zstd, python3, llvm-objdump and a container engine (CONTAINER_ENGINE, default docker).
+# Needs git, make, curl, zstd, python3, llvm-objdump and a container engine (CONTAINER_ENGINE, default docker).
 #
 # The build is CachyOS's own arm64 one (its release.yml: configure.sh --target-arch=arm64
 # --without-nvidia-libs, then make redist), except that Makefile.in's arm64 targets drop from
@@ -63,6 +63,40 @@ mkdir -p build
 cd build
 USE_LTO=0 ../proton/configure.sh --build-name="$NAME" --target-arch=arm64 --without-nvidia-libs \
     --container-engine="${CONTAINER_ENGINE:-docker}" --enable-ccache
+# piper (speech synthesis) builds piper-phonemize, which downloads onnxruntime 1.14.1 from
+# github.com/microsoft/onnxruntime: gone from GitHub since 2026-11. Microsoft's NuGet package has the same
+# build (its arm64 library is the one shipped on 2026-11-01, down to strip's section table); laid out as
+# that release's tarball where piper-phonemize looks before downloading.
+ORT=1.14.1 ORT_DL=obj-piper-aarch64/p/src/piper_phonemize_external-build/download
+if [ ! -f "$ORT_DL/onnxruntime-linux-aarch64-$ORT.tgz" ]; then
+    curl -fsSL --retry 3 -o onnxruntime.nupkg \
+        "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$ORT/microsoft.ml.onnxruntime.$ORT.nupkg"
+    python3 - onnxruntime.nupkg "$ORT" "$ORT_DL" <<'EOF'
+import hashlib, io, os, sys, tarfile, zipfile
+path, version, folder = sys.argv[1:]
+if hashlib.sha256(open(path, "rb").read()).hexdigest() != \
+        "3a277421efce94b5f91f4a5dc8efc1add99b4c01f547279d81098ffb4fafbb6d":
+    sys.exit(f"build.sh: {path} is not Microsoft.ML.OnnxRuntime {version} as checked in")
+nupkg, name = zipfile.ZipFile(path), f"onnxruntime-linux-aarch64-{version}"
+os.makedirs(folder, exist_ok=True)
+out = os.path.join(folder, name + ".tgz")
+with tarfile.open(out + ".part", "w:gz") as tar:
+    def add(member, blob=None, link=None):
+        info = tarfile.TarInfo(f"{name}/{member}")
+        if link:
+            info.type, info.linkname = tarfile.SYMTYPE, link
+        else:
+            info.size, info.mode = len(blob), 0o644
+        tar.addfile(info, io.BytesIO(blob) if blob is not None else None)
+    for f in nupkg.namelist():
+        if f.startswith("build/native/include/") and f.endswith(".h"):
+            add("include/" + os.path.basename(f), nupkg.read(f))
+    add(f"lib/libonnxruntime.so.{version}", nupkg.read("runtimes/linux-arm64/native/libonnxruntime.so"))
+    add("lib/libonnxruntime.so", link=f"libonnxruntime.so.{version}")
+os.replace(out + ".part", out)
+EOF
+    rm onnxruntime.nupkg
+fi
 make redist
 # CachyOS's redist renames redist/ to the build's name and tars it as .tar.xz: ours is .tar.zst.
 rm -f "$NAME.tar.xz" "$NAME.sha512sum"

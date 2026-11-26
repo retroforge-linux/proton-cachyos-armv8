@@ -52,7 +52,12 @@ Restart Steam and pick "Proton-CachyOS … (ARMv8.0)" per game or as the default
 ## Build locally
 
 `scripts/build.sh <tag> <workdir>` on an arm64 Linux host with docker (or `CONTAINER_ENGINE=podman`), git,
-make, zstd, python3 and llvm-objdump.
+make, curl, zstd, python3 and llvm-objdump.
+
+Proton's speech synthesis (piper) needs onnxruntime 1.14.1, which piper-phonemize downloaded from
+`microsoft/onnxruntime` on GitHub until that repository went away (2026-11). `build.sh` now takes the same
+build from Microsoft's NuGet package (`Microsoft.ML.OnnxRuntime`, SHA-256 checked) and puts it where
+piper-phonemize looks before downloading.
 
 ## Credits
 
