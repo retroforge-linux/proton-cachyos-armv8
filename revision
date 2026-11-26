@@ -1,5 +1,5 @@
 # The build recipe's revision: raise it when patches/ or scripts/build.sh change what a build of a
 # tag already released here produces. The next Sync then releases the newest tag again, as
-# <tag>-armv8.<revision> (scripts/release-tag.sh; revision 1 is plain <tag>-armv8).
+# <tag>-armv8-r<revision> (scripts/release-tag.sh; revision 1 is plain <tag>-armv8).
 # 2: DXVK-Sarek's DXGI makes swap chains for vkd3d-proton (patches/extras/dxvk-sarek/0001).
 2

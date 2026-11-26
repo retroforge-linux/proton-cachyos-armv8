@@ -26,7 +26,7 @@ order, before the build. One that no longer applies stops the build.
 
 CI (`.github/workflows/sync.yml`, daily) builds Proton-CachyOS's newest `cachyos-<version>-<date>-slr`
 release on GitHub's arm64 runners and publishes it with `proton-<tag>-armv8.tar.zst` and its `.sha256` and
-`.sha512`, as `<tag>-armv8`, or `<tag>-armv8.<n>` from the recipe's revision 2 on (`revision`,
+`.sha512`, as `<tag>-armv8`, or `<tag>-armv8-r<n>` from the recipe's revision 2 on (`revision`,
 `scripts/release-tag.sh`). Raising `revision` after a change to `patches/` or `scripts/build.sh` releases
 the newest tag again; installers that take the newest release by Proton version and then date pick it up.
 
