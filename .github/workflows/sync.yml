@@ -2,7 +2,7 @@ name: Sync
 
 # Builds Proton-CachyOS's newest release for ARMv8.0: the newest published, non-prerelease
 # `cachyos-<major>.<minor>-<yyyymmdd>-slr` release of CachyOS/proton-cachyos (by version, then date),
-# unless a release <tag>-armv8 exists here already.
+# unless its release here for the recipe's revision (scripts/release-tag.sh) exists already.
 
 on:
   schedule:
@@ -28,6 +28,8 @@ jobs:
     outputs:
       tag: ${{ steps.find.outputs.tag }}
     steps:
+      - uses: actions/checkout@v6
+
       - id: find
         env:
           GH_TOKEN: ${{ github.token }}
@@ -41,13 +43,13 @@ jobs:
             tag=$(gh api --paginate 'repos/CachyOS/proton-cachyos/releases?per_page=100' \
                     --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
                   grep -E '^cachyos-[0-9]+\.[0-9]+-[0-9]{8}-slr$' | sort -V | tail -1)
-            if [ -n "$tag" ] && released "$tag-armv8"; then
+            if [ -n "$tag" ] && released "$(scripts/release-tag.sh "$tag")"; then
               tag=
             fi
           fi
-          # A dispatch for a tag already released here: nothing to build.
-          if [ -n "$tag" ] && [ -n "$INPUT_TAG" ] && released "$tag-armv8"; then
-            echo "release $tag-armv8 exists already" >&2
+          # A dispatch for a tag already released here at this revision: nothing to build.
+          if [ -n "$tag" ] && [ -n "$INPUT_TAG" ] && released "$(scripts/release-tag.sh "$tag")"; then
+            echo "release $(scripts/release-tag.sh "$tag") exists already" >&2
             tag=
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
@@ -108,11 +110,12 @@ jobs:
         # job may skip its tag. A draft left by a failed upload is deleted and made again.
         run: |
           f="$RUNNER_TEMP/work/proton-$TAG-armv8.tar.zst"
-          gh release delete "$TAG-armv8" --yes 2>/dev/null || true
-          gh release create "$TAG-armv8" --draft --title "Proton-CachyOS ${TAG#cachyos-} (ARMv8.0)" \
-            --notes "Proton-CachyOS's [\`$TAG\`](https://github.com/CachyOS/proton-cachyos/releases/tag/$TAG) arm64 build, for ARMv8.0 CPUs (no LSE atomics): \`-march=armv8-a\`, and no inline LSE/RCpc in its arm64 binaries. Extract into \`compatibilitytools.d\`." \
+          rel=$(scripts/release-tag.sh "$TAG")
+          gh release delete "$rel" --yes 2>/dev/null || true
+          gh release create "$rel" --draft --title "Proton-CachyOS ${TAG#cachyos-} (ARMv8.0)" \
+            --notes "Proton-CachyOS's [\`$TAG\`](https://github.com/CachyOS/proton-cachyos/releases/tag/$TAG) arm64 build, for ARMv8.0 CPUs (no LSE atomics): \`-march=armv8-a\`, and no inline LSE/RCpc in its arm64 binaries, with the patches in [\`patches/\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$GITHUB_SHA/patches). Extract into \`compatibilitytools.d\`." \
             "$f" "$f.sha256" "$f.sha512"
-          gh release edit "$TAG-armv8" --draft=false
+          gh release edit "$rel" --draft=false
 
       - name: Report failure
         if: failure()
@@ -123,4 +126,4 @@ jobs:
           title="Build failed: $TAG"
           gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number' | grep -q . ||
             gh issue create --title "$title" \
-              --body "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. If build.sh's Makefile edits no longer match \`$TAG\`, refresh them."
+              --body "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. If build.sh's Makefile edits or a patch in patches/ no longer match \`$TAG\`, refresh them."

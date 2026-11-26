@@ -1,0 +1,356 @@
+From 98973a13e9b87ada87c64b4ef17d8fd56b7918a2 Mon Sep 17 00:00:00 2001
+From: sunshineinabox <aqemail@gmail.com>
+Date: Thu, 26 Nov 2026 02:05:39 -0800
+Subject: [PATCH] [dxgi] create swap chains for vkd3d-proton's command queues
+
+vkd3d-proton 2.8 and later offer only DXVK 2.x's IDXGIVkSwapChainFactory on their command queues, not IWineDXGISwapChainFactory, so every D3D12 swap chain failed with DXGI_ERROR_UNSUPPORTED. Their presenter now goes behind DxgiSwapChain through a small adapter to Sarek's presenter interface, with a surface factory for the window.
+---
+ src/dxgi/dxgi_factory.cpp  | 200 +++++++++++++++++++++++++++++++++++++
+ src/dxgi/dxgi_interfaces.h | 103 ++++++++++++++++++-
+ 2 files changed, 302 insertions(+), 1 deletion(-)
+
+diff --git a/src/dxgi/dxgi_factory.cpp b/src/dxgi/dxgi_factory.cpp
+index 7ff11f13..0225c898 100644
+--- a/src/dxgi/dxgi_factory.cpp
++++ b/src/dxgi/dxgi_factory.cpp
+@@ -2,8 +2,161 @@
+ #include "dxgi_swapchain.h"
+ #include "dxgi_swapchain_dispatcher.h"
+ 
++#include "../wsi/wsi_window.h"
++
+ namespace dxvk {
+ 
++  /**
++   * \brief Surface factory for the window of a swap chain
++   *
++   * Given to a device's IDXGIVkSwapChainFactory, which
++   * creates the surface on its own Vulkan instance.
++   */
++  class DxgiVkSurfaceFactory : public ComObject<IDXGIVkSurfaceFactory> {
++
++  public:
++
++    DxgiVkSurfaceFactory(PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr, HWND hWnd)
++    : m_vkGetInstanceProcAddr(vkGetInstanceProcAddr), m_window(hWnd) { }
++
++    HRESULT STDMETHODCALLTYPE QueryInterface(
++            REFIID                  riid,
++            void**                  ppvObject) {
++      if (ppvObject == nullptr)
++        return E_POINTER;
++
++      *ppvObject = nullptr;
++
++      if (riid == __uuidof(IUnknown)
++       || riid == __uuidof(IDXGIVkSurfaceFactory)) {
++        *ppvObject = ref(this);
++        return S_OK;
++      }
++
++      return E_NOINTERFACE;
++    }
++
++    VkResult STDMETHODCALLTYPE CreateSurface(
++            VkInstance              Instance,
++            VkPhysicalDevice        Adapter,
++            VkSurfaceKHR*           pSurface) {
++      return wsi::createSurface(m_window, m_vkGetInstanceProcAddr, Instance, pSurface);
++    }
++
++  private:
++
++    PFN_vkGetInstanceProcAddr m_vkGetInstanceProcAddr;
++    HWND                      m_window;
++
++  };
++
++
++  /**
++   * \brief A device's presenter behind the interface DxgiSwapChain takes
++   *
++   * vkd3d-proton's presenter has DXVK 2.x's interface. Every call
++   * DxgiSwapChain makes has a counterpart there, except mode-change
++   * notifications, which that presenter does not take.
++   */
++  class DxgiVkExternalPresenter : public ComObject<IDXGIVkSwapChain> {
++
++  public:
++
++    DxgiVkExternalPresenter(IDXGIVkExternalSwapChain* pPresenter)
++    : m_presenter(pPresenter) { }
++
++    HRESULT STDMETHODCALLTYPE QueryInterface(
++            REFIID                    riid,
++            void**                    ppvObject) {
++      if (ppvObject == nullptr)
++        return E_POINTER;
++
++      *ppvObject = nullptr;
++
++      if (riid == __uuidof(IUnknown)
++       || riid == __uuidof(IDXGIVkSwapChain)) {
++        *ppvObject = ref(this);
++        return S_OK;
++      }
++
++      return m_presenter->QueryInterface(riid, ppvObject);
++    }
++
++    HRESULT STDMETHODCALLTYPE GetDesc(
++            DXGI_SWAP_CHAIN_DESC1*    pDesc) {
++      return m_presenter->GetDesc(pDesc);
++    }
++
++    HRESULT STDMETHODCALLTYPE GetAdapter(
++            REFIID                    riid,
++            void**                    ppvObject) {
++      return m_presenter->GetAdapter(riid, ppvObject);
++    }
++
++    HRESULT STDMETHODCALLTYPE GetDevice(
++            REFIID                    riid,
++            void**                    ppDevice) {
++      return m_presenter->GetDevice(riid, ppDevice);
++    }
++
++    HRESULT STDMETHODCALLTYPE GetImage(
++            UINT                      BufferId,
++            REFIID                    riid,
++            void**                    ppBuffer) {
++      return m_presenter->GetImage(BufferId, riid, ppBuffer);
++    }
++
++    UINT STDMETHODCALLTYPE GetImageIndex() {
++      return m_presenter->GetImageIndex();
++    }
++
++    UINT STDMETHODCALLTYPE GetFrameLatency() {
++      return m_presenter->GetFrameLatency();
++    }
++
++    HANDLE STDMETHODCALLTYPE GetFrameLatencyEvent() {
++      return m_presenter->GetFrameLatencyEvent();
++    }
++
++    HRESULT STDMETHODCALLTYPE ChangeProperties(
++      const DXGI_SWAP_CHAIN_DESC1*    pDesc) {
++      return m_presenter->ChangeProperties(pDesc, nullptr, nullptr);
++    }
++
++    HRESULT STDMETHODCALLTYPE SetPresentRegion(
++      const RECT*                     pRegion) {
++      return m_presenter->SetPresentRegion(pRegion);
++    }
++
++    HRESULT STDMETHODCALLTYPE SetGammaControl(
++            UINT                      NumControlPoints,
++      const DXGI_RGB*                 pControlPoints) {
++      return m_presenter->SetGammaControl(NumControlPoints, pControlPoints);
++    }
++
++    HRESULT STDMETHODCALLTYPE SetFrameLatency(
++            UINT                      MaxLatency) {
++      return m_presenter->SetFrameLatency(MaxLatency);
++    }
++
++    HRESULT STDMETHODCALLTYPE Present(
++            UINT                      SyncInterval,
++            UINT                      PresentFlags,
++      const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
++      return m_presenter->Present(SyncInterval, PresentFlags, pPresentParameters);
++    }
++
++    void STDMETHODCALLTYPE NotifyModeChange(
++            BOOL                      Windowed,
++      const DXGI_MODE_DESC*           pDisplayMode) { }
++
++  private:
++
++    Com<IDXGIVkExternalSwapChain> m_presenter;
++
++  };
++
++
+   DxgiFactory::DxgiFactory(UINT Flags)
+   : m_instance    (new DxvkInstance()),
+     m_monitorInfo (this),
+@@ -158,6 +311,53 @@ namespace dxvk {
+       return hr;
+     }
+ 
++    // vkd3d-proton's command queues: their own presenter,
++    // with DXGI's half of the swap chain done here
++    Com<IDXGIVkSwapChainFactory> vkFactory;
++
++    if (SUCCEEDED(pDevice->QueryInterface(
++          __uuidof(IDXGIVkSwapChainFactory),
++          reinterpret_cast<void**>(&vkFactory)))) {
++      DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
++
++      wsi::getWindowSize(hWnd,
++        desc.Width  ? nullptr : &desc.Width,
++        desc.Height ? nullptr : &desc.Height);
++
++      DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsDesc;
++
++      if (pFullscreenDesc) {
++        fsDesc = *pFullscreenDesc;
++      } else {
++        fsDesc.RefreshRate      = { 0, 0 };
++        fsDesc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
++        fsDesc.Scaling          = DXGI_MODE_SCALING_UNSPECIFIED;
++        fsDesc.Windowed         = TRUE;
++      }
++
++      Com<IDXGIVkSurfaceFactory> surfaceFactory = new DxgiVkSurfaceFactory(
++        m_instance->vki()->getLoaderProc(), hWnd);
++      Com<IDXGIVkExternalSwapChain> presenter;
++
++      HRESULT hr = vkFactory->CreateSwapChain(surfaceFactory.ptr(), &desc, &presenter);
++
++      if (FAILED(hr)) {
++        Logger::err(str::format("DXGI: CreateSwapChainForHwnd: Failed to create swap chain, hr ", hr));
++        return hr;
++      }
++
++      try {
++        Com<IDXGIVkSwapChain> bridge = new DxgiVkExternalPresenter(presenter.ptr());
++
++        *ppSwapChain = new DxgiSwapChainDispatcher(ref(new DxgiSwapChain(
++          this, bridge.ptr(), hWnd, &desc, &fsDesc)));
++        return S_OK;
++      } catch (const DxvkError& e) {
++        Logger::err(e.message());
++        return E_INVALIDARG;
++      }
++    }
++
+     Logger::err("DXGI: CreateSwapChainForHwnd: Unsupported device type");
+     return DXGI_ERROR_UNSUPPORTED;
+   }
+diff --git a/src/dxgi/dxgi_interfaces.h b/src/dxgi/dxgi_interfaces.h
+index f7a93950..4f33ad6e 100644
+--- a/src/dxgi/dxgi_interfaces.h
++++ b/src/dxgi/dxgi_interfaces.h
+@@ -355,7 +355,105 @@ IWineDXGISwapChainFactory : public IUnknown {
+ };
+ 
+ 
++struct DXGI_VK_HDR_METADATA;
++
++/**
++ * \brief Presenter made by a device's swap chain factory
++ *
++ * DXVK 2.x's IDXGIVkSwapChain (its interface ID and layout), which
++ * vkd3d-proton's command queues create. Same role as the presenter
++ * above, behind which DxgiVkExternalPresenter puts it.
++ */
++MIDL_INTERFACE("e4a9059e-b569-46ab-8de7-501bd2bc7f7a")
++IDXGIVkExternalSwapChain : public IUnknown {
++  virtual HRESULT STDMETHODCALLTYPE GetDesc(
++          DXGI_SWAP_CHAIN_DESC1*    pDesc) = 0;
++
++  virtual HRESULT STDMETHODCALLTYPE GetAdapter(
++          REFIID                    riid,
++          void**                    ppvObject) = 0;
++
++  virtual HRESULT STDMETHODCALLTYPE GetDevice(
++          REFIID                    riid,
++          void**                    ppDevice) = 0;
++
++  virtual HRESULT STDMETHODCALLTYPE GetImage(
++          UINT                      BufferId,
++          REFIID                    riid,
++          void**                    ppBuffer) = 0;
++
++  virtual UINT STDMETHODCALLTYPE GetImageIndex() = 0;
++
++  virtual UINT STDMETHODCALLTYPE GetFrameLatency() = 0;
++
++  virtual HANDLE STDMETHODCALLTYPE GetFrameLatencyEvent() = 0;
++
++  virtual HRESULT STDMETHODCALLTYPE ChangeProperties(
++    const DXGI_SWAP_CHAIN_DESC1*    pDesc,
++    const UINT*                     pNodeMasks,
++          IUnknown* const*          ppPresentQueues) = 0;
++
++  virtual HRESULT STDMETHODCALLTYPE SetPresentRegion(
++    const RECT*                     pRegion) = 0;
++
++  virtual HRESULT STDMETHODCALLTYPE SetGammaControl(
++          UINT                      NumControlPoints,
++    const DXGI_RGB*                 pControlPoints) = 0;
++
++  virtual HRESULT STDMETHODCALLTYPE SetFrameLatency(
++          UINT                      MaxLatency) = 0;
++
++  virtual HRESULT STDMETHODCALLTYPE Present(
++          UINT                      SyncInterval,
++          UINT                      PresentFlags,
++    const DXGI_PRESENT_PARAMETERS*  pPresentParameters) = 0;
++
++  virtual UINT STDMETHODCALLTYPE CheckColorSpaceSupport(
++          DXGI_COLOR_SPACE_TYPE     ColorSpace) = 0;
++
++  virtual HRESULT STDMETHODCALLTYPE SetColorSpace(
++          DXGI_COLOR_SPACE_TYPE     ColorSpace) = 0;
++
++  virtual HRESULT STDMETHODCALLTYPE SetHDRMetaData(
++    const DXGI_VK_HDR_METADATA*     pMetaData) = 0;
++};
++
++
++/**
++ * \brief Vulkan surface factory
++ *
++ * Creates a surface for the swap chain's window
++ * on the Vulkan instance of the device.
++ */
++MIDL_INTERFACE("1e7895a1-1bc3-4f9c-a670-290a4bc9581a")
++IDXGIVkSurfaceFactory : public IUnknown {
++  virtual VkResult STDMETHODCALLTYPE CreateSurface(
++          VkInstance                Instance,
++          VkPhysicalDevice          Adapter,
++          VkSurfaceKHR*             pSurface) = 0;
++};
++
++
++/**
++ * \brief Swap chain factory of a device
++ *
++ * How vkd3d-proton's command queues make their presenter
++ * (DXVK 2.x's interface). They no longer offer
++ * IWineDXGISwapChainFactory.
++ */
++MIDL_INTERFACE("e7d6c3ca-23a0-4e08-9f2f-ea5231df6633")
++IDXGIVkSwapChainFactory : public IUnknown {
++  virtual HRESULT STDMETHODCALLTYPE CreateSwapChain(
++          IDXGIVkSurfaceFactory*    pSurfaceFactory,
++    const DXGI_SWAP_CHAIN_DESC1*    pDesc,
++          IDXGIVkExternalSwapChain** ppSwapChain) = 0;
++};
++
++
+ #ifdef _MSC_VER
++struct __declspec(uuid("e4a9059e-b569-46ab-8de7-501bd2bc7f7a")) IDXGIVkExternalSwapChain;
++struct __declspec(uuid("1e7895a1-1bc3-4f9c-a670-290a4bc9581a")) IDXGIVkSurfaceFactory;
++struct __declspec(uuid("e7d6c3ca-23a0-4e08-9f2f-ea5231df6633")) IDXGIVkSwapChainFactory;
+ struct __declspec(uuid("907bf281-ea3c-43b4-a8e4-9f231107b4ff")) IDXGIDXVKAdapter;
+ struct __declspec(uuid("92a5d77b-b6e1-420a-b260-fdd701272827")) IDXGIDXVKDevice;
+ struct __declspec(uuid("c06a236f-5be3-448a-8943-89c611c0c2c1")) IDXGIVkMonitorInfo;
+@@ -366,7 +464,10 @@ struct __declspec(uuid("5546cf8c-77e7-4341-b05d-8d4d5000e77d")) IDXGIVkInteropSu
+ struct __declspec(uuid("104001a6-7f36-4957-b932-86ade9567d91")) IDXGIVkSwapChain;
+ struct __declspec(uuid("53cb4ff0-c25a-4164-a891-0e83db0a7aac")) IWineDXGISwapChainFactory;
+ #else
+-__CRT_UUID_DECL(IDXGIDXVKAdapter,          0x907bf281,0xea3c,0x43b4,0xa8,0xe4,0x9f,0x23,0x11,0x07,0xb4,0xff);
++__CRT_UUID_DECL(IDXGIVkExternalSwapChain,  0xe4a9059e,0xb569,0x46ab,0x8d,0xe7,0x50,0x1b,0xd2,0xbc,0x7f,0x7a);
++__CRT_UUID_DECL(IDXGIVkSurfaceFactory,     0x1e7895a1,0x1bc3,0x4f9c,0xa6,0x70,0x29,0x0a,0x4b,0xc9,0x58,0x1a);
++__CRT_UUID_DECL(IDXGIVkSwapChainFactory,   0xe7d6c3ca,0x23a0,0x4e08,0x9f,0x2f,0xea,0x52,0x31,0xdf,0x66,0x33);
++__CRT_UUID_DECL(IDXGIDXVKAdapter,         0x907bf281,0xea3c,0x43b4,0xa8,0xe4,0x9f,0x23,0x11,0x07,0xb4,0xff);
+ __CRT_UUID_DECL(IDXGIDXVKDevice,           0x92a5d77b,0xb6e1,0x420a,0xb2,0x60,0xfd,0xf7,0x01,0x27,0x28,0x27);
+ __CRT_UUID_DECL(IDXGIVkMonitorInfo,        0xc06a236f,0x5be3,0x448a,0x89,0x43,0x89,0xc6,0x11,0xc0,0xc2,0xc1);
+ __CRT_UUID_DECL(IDXGIVkInteropAdapter,     0x3a6d8f2c,0xb0e8,0x4ab4,0xb4,0xdc,0x4f,0xd2,0x48,0x91,0xbf,0xa5);
+-- 
+2.56.1
+

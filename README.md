@@ -7,14 +7,28 @@ CachyOS builds its arm64 Proton with `-march=armv8.2-a -mtune=cortex-x3`, so on 
 FEX components fault on the first atomic instruction, or run only through slow kernel emulation. These builds
 are CachyOS's own arm64 build (its `release.yml`: `configure.sh --target-arch=arm64 --without-nvidia-libs`,
 `make redist`) with the arm64 targets at `-march=armv8-a` (C) and `-Ctarget-cpu=generic` (Rust), and FEX
-tuned for a generic CPU. Everything else is CachyOS's: DXVK-Sarek (`PROTON_DXVK_SAREK=1`), umu and
-umu-protonfixes, so it also runs games without the Steam client (`UMU_ID`), as umu-run does.
+tuned for a generic CPU, plus the patches below. Everything else is CachyOS's: DXVK-Sarek
+(`PROTON_DXVK_SAREK=1`), umu and umu-protonfixes, so it also runs games without the Steam client
+(`UMU_ID`), as umu-run does.
+
+## Patches
+
+`patches/<folder>/*.patch` go into that folder of CachyOS's checkout (a submodule) as commits, in name
+order, before the build. One that no longer applies stops the build.
+
+- `extras/dxvk-sarek/0001`: DXVK-Sarek's DXGI makes swap chains for vkd3d-proton. Sarek's DXGI took only
+  devices offering Wine's `IWineDXGISwapChainFactory`, which vkd3d-proton dropped in 2.8 for DXVK 2.x's
+  `IDXGIVkSwapChainFactory`, so with Sarek on (the Adreno 610/613, whose missing multiViewport rules out
+  upstream DXVK) every D3D12 game failed creating its swap chain with `DXGI_ERROR_UNSUPPORTED`. D3D10/11
+  swap chains take the same path as before.
 
 ## Releases
 
 CI (`.github/workflows/sync.yml`, daily) builds Proton-CachyOS's newest `cachyos-<version>-<date>-slr`
-release on GitHub's arm64 runners and publishes it as `<tag>-armv8`, with `proton-<tag>-armv8.tar.zst` and
-its `.sha256` and `.sha512`.
+release on GitHub's arm64 runners and publishes it with `proton-<tag>-armv8.tar.zst` and its `.sha256` and
+`.sha512`, as `<tag>-armv8`, or `<tag>-armv8.<n>` from the recipe's revision 2 on (`revision`,
+`scripts/release-tag.sh`). Raising `revision` after a change to `patches/` or `scripts/build.sh` releases
+the newest tag again; installers that take the newest release by Proton version and then date pick it up.
 
 A release is published only when every native arm64 binary passes `scripts/scan-lse.py`: no LSE/RCpc
 instruction outside the compiler's runtime-checked outline-atomics helpers. Exceptions go in

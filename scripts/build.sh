@@ -11,6 +11,7 @@
 # -march=armv8.2-a to -march=armv8-a (C and Rust) and FEX is tuned for a generic CPU. Each of those
 # edits must hit exactly the lines expected: when CachyOS changes them, the build stops here instead
 # of shipping a build that still has LSE. The LSE scan at the end is the release gate either way.
+# patches/ holds the few fixes this build adds to CachyOS's sources (README.md, Patches).
 set -euo pipefail
 
 TAG=${1:?usage: build.sh <tag> <workdir>}
@@ -41,6 +42,16 @@ if [ ! -d proton ]; then
     edit proton/Makefile.in 2 's/^\(aarch64\|arm64ec\)_CFLAGS \(:\?=\) -O2 -march=armv8\.2-a -mtune=cortex-x3$/\1_CFLAGS \2 -O2 -march=armv8-a/'
     edit proton/Makefile.in 2 's/^\(aarch64\|arm64ec\)_RUSTFLAGS \(:\?=\) \(.*\)-Ctarget-cpu=armv8\.2-a$/\1_RUSTFLAGS \2 \3-Ctarget-cpu=generic/'
     edit proton/Makefile.in 1 's/-DTUNE_CPU=none /-DTUNE_CPU=generic /'
+    # patches/<folder>/*.patch go into that folder of the checkout (a submodule) as commits, so its
+    # version says it is patched. One that does not apply stops the build.
+    for p in $(cd "$HERE/patches" && find . -name '*.patch' | sort); do
+        p=${p#./}
+        if ! GIT_COMMITTER_NAME=build.sh GIT_COMMITTER_EMAIL=build.sh@invalid \
+                git -C "proton/$(dirname "$p")" am --keep-non-patch -q "$HERE/patches/$p"; then
+            echo "build.sh: patches/$p does not apply to proton/$(dirname "$p"): refresh it for $TAG" >&2
+            exit 1
+        fi
+    done
 fi
 shopt -s nullglob
 if grep -n 'armv8\.[1-9]\|cortex-x' proton/Makefile.in proton/extras/*.mk; then
