@@ -21,6 +21,11 @@ order, before the build. One that no longer applies stops the build.
   `IDXGIVkSwapChainFactory`, so with Sarek on (the Adreno 610/613, whose missing multiViewport rules out
   upstream DXVK) every D3D12 game failed creating its swap chain with `DXGI_ERROR_UNSUPPORTED`. D3D10/11
   swap chains take the same path as before.
+- `extras/dxvk-sarek/0002`: typeless RGBA8 and RGB10A2 textures get only their UNORM (and sRGB) view formats,
+  so Turnip keeps them UBWC-compressed on the Adreno 6xx, whose UBWC cannot be read through UINT, SINT or
+  SNORM views (Hollow Knight on the A610: 51.3 -> 47.4 ms GPU per frame). A view outside that list before
+  the texture's first use rebuilds it with the whole family; a later one logs a warning, and
+  `DXVK_CONFIG="d3d11.narrowTypelessFormats = False"` turns it off for a game.
 
 ## Releases
 

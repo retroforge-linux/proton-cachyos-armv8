@@ -1,0 +1,665 @@
+From 70c4871a4d16e26b46c27c56e19e9b105ffbb0d0 Mon Sep 17 00:00:00 2001
+From: sunshineinabox <aqemail@gmail.com>
+Date: Thu, 26 Nov 2026 10:11:31 -0800
+Subject: [PATCH] [d3d11] narrow typeless colour textures to their UNORM view
+ formats
+
+Typeless RGBA8 and RGB10A2 textures that only D3D11 sees get just their UNORM (and sRGB) view formats, so that drivers such as Turnip on the Adreno 6xx keep them compressed. A view in another format of the family before the texture's first use rebuilds it with the whole family and copies its contents; a later one logs a warning (d3d11.narrowTypelessFormats, on by default).
+---
+ dxvk.conf                       |  11 +++
+ src/d3d11/d3d11_device.h        |   4 +
+ src/d3d11/d3d11_initializer.cpp |  29 +++++-
+ src/d3d11/d3d11_initializer.h   |   4 +
+ src/d3d11/d3d11_options.cpp     |   1 +
+ src/d3d11/d3d11_options.h       |   6 ++
+ src/d3d11/d3d11_texture.cpp     | 169 +++++++++++++++++++++++++++++++-
+ src/d3d11/d3d11_texture.h       |  83 ++++++++++++++++
+ src/d3d11/d3d11_view_dsv.cpp    |   2 +-
+ src/d3d11/d3d11_view_rtv.cpp    |  21 +++-
+ src/d3d11/d3d11_view_rtv.h      |  12 ++-
+ src/d3d11/d3d11_view_srv.cpp    |  21 +++-
+ src/d3d11/d3d11_view_srv.h      |  12 ++-
+ src/d3d11/d3d11_view_uav.cpp    |   2 +-
+ 14 files changed, 362 insertions(+), 15 deletions(-)
+
+diff --git a/dxvk.conf b/dxvk.conf
+index c1592ad8..1f0e3186 100644
+--- a/dxvk.conf
++++ b/dxvk.conf
+@@ -288,6 +288,17 @@
+ # d3d11.disableMsaa = False
+ 
+ 
++# Creates typeless RGBA8 and RGB10A2 textures with only their UNORM (and
++# sRGB) view formats, so that drivers such as Turnip on the Adreno 6xx can
++# keep them compressed. A texture that gets a view in another format of its
++# family before its first use is rebuilt with the whole family; one that
++# gets it later keeps the narrowed list, and a warning is logged.
++#
++# Supported values: True, False
++
++# d3d11.narrowTypelessFormats = True
++
++
+ # Zero-initialize workgroup (TGSM) memory in compute shaders. Some games
+ # don't do this and rely on undefined behaviour. Enabling may reduce
+ # performance.
+diff --git a/src/d3d11/d3d11_device.h b/src/d3d11/d3d11_device.h
+index 5a99bd62..2f2909c0 100644
+--- a/src/d3d11/d3d11_device.h
++++ b/src/d3d11/d3d11_device.h
+@@ -413,6 +413,10 @@ namespace dxvk {
+       return DxvkCsChunkRef(chunk, &m_csChunkPool);
+     }
+     
++    void InitRebuiltTexture(D3D11CommonTexture* pTexture, const Rc<DxvkImage>& OldImage) {
++      m_initializer->InitRebuiltTexture(pTexture, OldImage);
++    }
++
+     const D3D11Options* GetOptions() const {
+       return &m_d3d11Options;
+     }
+diff --git a/src/d3d11/d3d11_initializer.cpp b/src/d3d11/d3d11_initializer.cpp
+index 5fc53956..8acbb8f6 100644
+--- a/src/d3d11/d3d11_initializer.cpp
++++ b/src/d3d11/d3d11_initializer.cpp
+@@ -68,6 +68,31 @@ namespace dxvk {
+   }
+ 
+ 
++  void D3D11Initializer::InitRebuiltTexture(
++          D3D11CommonTexture*         pTexture,
++    const Rc<DxvkImage>&              OldImage) {
++    std::lock_guard<dxvk::mutex> lock(m_mutex);
++
++    // The new image takes the old one's contents (its initial data or its
++    // zero clear, recorded before this), with every subresource in full
++    Rc<DxvkImage> image = pTexture->PeekImage();
++    const DxvkImageCreateInfo& info = image->info();
++    auto formatInfo = imageFormatInfo(info.format);
++
++    for (uint32_t level = 0; level < info.mipLevels; level++) {
++      VkImageSubresourceLayers layers = { formatInfo->aspectMask, level, 0, info.numLayers };
++
++      m_context->copyImage(
++        image,    layers, VkOffset3D { 0, 0, 0 },
++        OldImage, layers, VkOffset3D { 0, 0, 0 },
++        image->mipLevelExtent(level));
++    }
++
++    m_transferCommands += info.mipLevels;
++    FlushImplicit();
++  }
++
++
+   void D3D11Initializer::InitDeviceLocalBuffer(
+           D3D11Buffer*                pBuffer,
+     const D3D11_SUBRESOURCE_DATA*     pInitialData) {
+@@ -119,7 +144,7 @@ namespace dxvk {
+     const D3D11_SUBRESOURCE_DATA*     pInitialData) {
+     std::lock_guard<dxvk::mutex> lock(m_mutex);
+ 
+-    Rc<DxvkImage> image = pTexture->GetImage();
++    Rc<DxvkImage> image = pTexture->PeekImage();
+ 
+     auto mapMode = pTexture->GetMapMode();
+     auto desc = pTexture->Desc();
+@@ -206,7 +231,7 @@ namespace dxvk {
+   void D3D11Initializer::InitHostVisibleTexture(
+           D3D11CommonTexture*         pTexture,
+     const D3D11_SUBRESOURCE_DATA*     pInitialData) {
+-    Rc<DxvkImage> image = pTexture->GetImage();
++    Rc<DxvkImage> image = pTexture->PeekImage();
+ 
+     for (uint32_t layer = 0; layer < image->info().numLayers; layer++) {
+       for (uint32_t level = 0; level < image->info().mipLevels; level++) {
+diff --git a/src/d3d11/d3d11_initializer.h b/src/d3d11/d3d11_initializer.h
+index 8c96babd..274732ec 100644
+--- a/src/d3d11/d3d11_initializer.h
++++ b/src/d3d11/d3d11_initializer.h
+@@ -37,6 +37,10 @@ namespace dxvk {
+ 
+     void InitUavCounter(
+             D3D11UnorderedAccessView*   pUav);
++
++    void InitRebuiltTexture(
++            D3D11CommonTexture*         pTexture,
++      const Rc<DxvkImage>&              OldImage);
+     
+   private:
+ 
+diff --git a/src/d3d11/d3d11_options.cpp b/src/d3d11/d3d11_options.cpp
+index dd24f6e4..107ef194 100644
+--- a/src/d3d11/d3d11_options.cpp
++++ b/src/d3d11/d3d11_options.cpp
+@@ -20,6 +20,7 @@ namespace dxvk {
+     this->invariantPosition     = config.getOption<bool>("d3d11.invariantPosition", true);
+     this->floatControls         = config.getOption<bool>("d3d11.floatControls", true);
+     this->disableMsaa           = config.getOption<bool>("d3d11.disableMsaa", false);
++    this->narrowTypelessFormats = config.getOption<bool>("d3d11.narrowTypelessFormats", true);
+     this->deferSurfaceCreation  = config.getOption<bool>("dxgi.deferSurfaceCreation", false);
+     this->numBackBuffers        = config.getOption<int32_t>("dxgi.numBackBuffers", 0);
+     this->maxFrameLatency       = config.getOption<int32_t>("dxgi.maxFrameLatency", 0);
+diff --git a/src/d3d11/d3d11_options.h b/src/d3d11/d3d11_options.h
+index ac0b3725..20cd417c 100644
+--- a/src/d3d11/d3d11_options.h
++++ b/src/d3d11/d3d11_options.h
+@@ -107,6 +107,12 @@ namespace dxvk {
+     /// performs the required shader and resolve fixups.
+     bool disableMsaa;
+ 
++    /// Create typeless colour textures with only the view formats that share
++    /// their base format's encoding (UNORM and sRGB), so that drivers can keep
++    /// them compressed. A view in another format of the family rebuilds the
++    /// texture with the full list while the texture is still unused.
++    bool narrowTypelessFormats;
++
+     /// Dynamic resources with the given bind flags will be allocated
+     /// in cached system memory. Enabled automatically when recording
+     /// an api trace.
+diff --git a/src/d3d11/d3d11_texture.cpp b/src/d3d11/d3d11_texture.cpp
+index 428cea8c..792895f1 100644
+--- a/src/d3d11/d3d11_texture.cpp
++++ b/src/d3d11/d3d11_texture.cpp
+@@ -200,6 +200,29 @@ namespace dxvk {
+     imageInfo.usage |= EnableMetaPackUsage(imageInfo.format, m_desc.CPUAccessFlags);
+     imageInfo.usage |= EnableMetaCopyUsage(imageInfo.format, imageInfo.tiling);
+ 
++    // Keep only the formats that share the base format's encoding, so that
++    // the driver can compress the image (d3d11.narrowTypelessFormats)
++    if (imageInfo.viewFormatCount > 1 && vkImage == VK_NULL_HANDLE
++     && CanNarrowFormats(imageInfo, isMultiPlane)) {
++      VkFormat srgb = VK_FORMAT_UNDEFINED;
++
++      if (imageInfo.format == VK_FORMAT_R8G8B8A8_UNORM)
++        srgb = VK_FORMAT_R8G8B8A8_SRGB;
++
++      for (uint32_t i = 0; i < imageInfo.viewFormatCount; i++) {
++        m_fullFamily.Add(imageInfo.viewFormats[i]);
++
++        if (imageInfo.viewFormats[i] == imageInfo.format || imageInfo.viewFormats[i] == srgb)
++          m_viewFamily.Add(imageInfo.viewFormats[i]);
++      }
++
++      if (m_viewFamily.FormatCount < m_fullFamily.FormatCount) {
++        imageInfo.viewFormatCount = m_viewFamily.FormatCount;
++        imageInfo.viewFormats     = m_viewFamily.Formats;
++        m_narrowState.store(NarrowUnused, std::memory_order_relaxed);
++      }
++    }
++
+     for (uint32_t i = 0; i < imageInfo.viewFormatCount; i++)
+       imageInfo.usage |= EnableMetaCopyUsage(imageInfo.viewFormats[i], imageInfo.tiling);
+ 
+@@ -230,11 +253,143 @@ namespace dxvk {
+     else
+       m_image = m_device->GetDXVKDevice()->createImageFromVkImage(imageInfo, vkImage);
+ 
++    if (m_narrowState.load(std::memory_order_relaxed) == NarrowUnused) {
++      m_imageInfo = imageInfo;
++      m_memoryProperties = memoryProperties;
++    }
++
+     if (imageInfo.sharing.mode == DxvkSharedHandleMode::Export)
+       ExportImageInfo();
+   }
+ 
+ 
++  bool D3D11CommonTexture::CanNarrowFormats(
++    const DxvkImageCreateInfo&  ImageInfo,
++          BOOL                  IsMultiPlane) const {
++    if (!m_device->GetOptions()->narrowTypelessFormats)
++      return false;
++
++    // Only textures that nothing outside D3D11's views and copies can see
++    if (m_mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_NONE
++     || ImageInfo.shared || ImageInfo.sharing.mode != DxvkSharedHandleMode::None
++     || IsMultiPlane || ImageInfo.tiling != VK_IMAGE_TILING_OPTIMAL
++     || (m_dxgiUsage & DXGI_USAGE_BACK_BUFFER))
++      return false;
++
++    const UINT miscFlags = D3D11_RESOURCE_MISC_SHARED
++                         | D3D11_RESOURCE_MISC_SHARED_NTHANDLE
++                         | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
++                         | D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
++
++    // UAVs add the R32 formats; video and depth are left alone
++    const UINT bindFlags = D3D11_BIND_UNORDERED_ACCESS
++                         | D3D11_BIND_DEPTH_STENCIL
++                         | D3D11_BIND_DECODER
++                         | D3D11_BIND_VIDEO_ENCODER;
++
++    if ((m_desc.MiscFlags & miscFlags) || (m_desc.BindFlags & bindFlags))
++      return false;
++
++    // Families whose members compress differently: RGBA8 (UNORM and sRGB
++    // apart from SNORM and the integer formats) and RGB10A2 (UNORM and UINT)
++    return ImageInfo.format == VK_FORMAT_R8G8B8A8_UNORM
++        || ImageInfo.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++  }
++
++
++  bool D3D11CommonTexture::FamilyHas(
++    const DXGI_VK_FORMAT_FAMILY& Family,
++          VkFormat              Format) {
++    for (uint32_t i = 0; i < Family.FormatCount; i++) {
++      if (Family.Formats[i] == Format)
++        return true;
++    }
++
++    return false;
++  }
++
++
++  void D3D11CommonTexture::MarkUsed() const {
++    std::lock_guard<dxvk::mutex> lock(m_narrowMutex);
++    uint32_t expected = NarrowUnused;
++    m_narrowState.compare_exchange_strong(expected, NarrowUsed, std::memory_order_acq_rel);
++  }
++
++
++  void D3D11CommonTexture::AttachView(
++          D3D11ImageViewOwner*  pView,
++          VkFormat              Format) {
++    std::lock_guard<dxvk::mutex> lock(m_narrowMutex);
++    uint32_t state = m_narrowState.load(std::memory_order_acquire);
++
++    if ((state == NarrowUnused || state == NarrowUsed)
++     && !FamilyHas(m_viewFamily, Format) && FamilyHas(m_fullFamily, Format)) {
++      if (state == NarrowUnused) {
++        WidenLocked(Format);
++      } else if (!m_warnedUsedView) {
++        m_warnedUsedView = true;
++        Logger::warn(str::format("D3D11: ", m_desc.Width, "x", m_desc.Height,
++          " texture with a narrowed format list gets a ", Format,
++          " view after its first use; compressed blocks may read wrong through it",
++          " (set d3d11.narrowTypelessFormats = False for this game)"));
++      }
++    }
++
++    pView->CreateImageView(m_image);
++
++    if (m_narrowState.load(std::memory_order_relaxed) == NarrowUnused)
++      m_views.push_back(pView);
++  }
++
++
++  void D3D11CommonTexture::DetachView(
++          D3D11ImageViewOwner*  pView) {
++    std::lock_guard<dxvk::mutex> lock(m_narrowMutex);
++
++    for (auto i = m_views.begin(); i != m_views.end(); i++) {
++      if (*i == pView) {
++        m_views.erase(i);
++        break;
++      }
++    }
++  }
++
++
++  bool D3D11CommonTexture::WidenLocked(
++          VkFormat              Format) {
++    DxvkImageCreateInfo info = m_imageInfo;
++    info.viewFormatCount = m_fullFamily.FormatCount;
++    info.viewFormats     = m_fullFamily.Formats;
++
++    for (uint32_t i = 0; i < info.viewFormatCount; i++)
++      info.usage |= EnableMetaCopyUsage(info.viewFormats[i], info.tiling);
++
++    if (!CheckImageSupport(&info, info.tiling)) {
++      Logger::warn(str::format("D3D11: Cannot rebuild ", m_desc.Width, "x", m_desc.Height,
++        " texture for a ", Format, " view"));
++      m_narrowState.store(NarrowUsed, std::memory_order_release);
++      return false;
++    }
++
++    // Nothing but its initialization has used the image yet: a new image
++    // takes its place and its contents, and its views move to it
++    Rc<DxvkImage> oldImage = m_image;
++    m_image     = m_device->GetDXVKDevice()->createImage(info, m_memoryProperties);
++    m_imageInfo = info;
++
++    for (auto view : m_views)
++      view->CreateImageView(m_image);
++
++    m_views.clear();
++    m_device->InitRebuiltTexture(this, oldImage);
++    m_narrowState.store(NarrowWidened, std::memory_order_release);
++
++    Logger::info(str::format("D3D11: Rebuilt ", m_desc.Width, "x", m_desc.Height,
++      " texture with its full format list for a ", Format, " view"));
++    return true;
++  }
++
++
+   D3D11CommonTexture::~D3D11CommonTexture() {
+ 
+   }
+@@ -351,7 +506,19 @@ namespace dxvk {
+ 
+ 
+   bool D3D11CommonTexture::CheckViewCompatibility(UINT BindFlags, DXGI_FORMAT Format, UINT Plane) const {
+-    const DxvkImageCreateInfo& imageInfo = m_image->info();
++    std::unique_lock<dxvk::mutex> narrowLock(m_narrowMutex, std::defer_lock);
++
++    if (m_narrowState.load(std::memory_order_acquire) != NarrowNone)
++      narrowLock.lock();
++
++    DxvkImageCreateInfo imageInfo = m_image->info();
++
++    // A narrowed texture takes views of its whole family: AttachView
++    // rebuilds it, or warns once it is too late to
++    if (m_narrowState.load(std::memory_order_relaxed) != NarrowNone) {
++      imageInfo.viewFormatCount = m_fullFamily.FormatCount;
++      imageInfo.viewFormats     = m_fullFamily.Formats;
++    }
+ 
+     // Check whether the given bind flags are supported
+     if ((m_desc.BindFlags & BindFlags) != BindFlags)
+diff --git a/src/d3d11/d3d11_texture.h b/src/d3d11/d3d11_texture.h
+index 87625be7..0cca709f 100644
+--- a/src/d3d11/d3d11_texture.h
++++ b/src/d3d11/d3d11_texture.h
+@@ -61,6 +61,18 @@ namespace dxvk {
+   };
+   
+   
++  /**
++   * \brief A view whose image view follows its texture's image
++   *
++   * Narrowed textures (d3d11.narrowTypelessFormats) may get a new image
++   * when a view needs a format outside the narrowed list.
++   */
++  class D3D11ImageViewOwner {
++  public:
++    virtual void CreateImageView(const Rc<DxvkImage>& Image) = 0;
++  };
++
++
+   /**
+    * \brief D3D11 common texture object
+    * 
+@@ -187,8 +199,49 @@ namespace dxvk {
+      * \returns The DXVK image
+      */
+     Rc<DxvkImage> GetImage() const {
++      // A narrowed texture is rebuilt only while nothing has used it
++      if (unlikely(m_narrowState.load(std::memory_order_acquire) == NarrowUnused))
++        MarkUsed();
+       return m_image;
+     }
++
++    /**
++     * \brief The DXVK image, without counting as a use
++     *
++     * For the texture's own initialization and its views' creation.
++     * \returns The DXVK image
++     */
++    Rc<DxvkImage> PeekImage() const {
++      return m_image;
++    }
++
++    /**
++     * \brief Counts a context's use of one of the texture's views
++     */
++    void NotifyUse() const {
++      if (unlikely(m_narrowState.load(std::memory_order_acquire) == NarrowUnused))
++        MarkUsed();
++    }
++
++    /**
++     * \brief Creates a view's image view on the current image
++     *
++     * Rebuilds a narrowed, still unused texture with its full format list
++     * first when the view's format is not in the narrowed list. Keeps the
++     * view so that a later rebuild can move it to the new image.
++     * \param [in] pView The view
++     * \param [in] Format The view's format
++     */
++    void AttachView(
++            D3D11ImageViewOwner*  pView,
++            VkFormat              Format);
++
++    /**
++     * \brief Forgets a view passed to AttachView
++     * \param [in] pView The view
++     */
++    void DetachView(
++            D3D11ImageViewOwner*  pView);
+     
+     /**
+      * \brief Mapped subresource buffer
+@@ -394,7 +447,37 @@ namespace dxvk {
+     
+     Rc<DxvkImage>                 m_image;
+     std::vector<MappedBuffer>     m_buffers;
++
+     std::vector<MappedInfo>       m_mapInfo;
++
++    enum NarrowState : uint32_t {
++      NarrowNone    = 0,  ///< Full format list
++      NarrowUnused  = 1,  ///< Narrowed, nothing has used it yet
++      NarrowUsed    = 2,  ///< Narrowed and used: no rebuild any more
++      NarrowWidened = 3,  ///< Rebuilt with the full format list
++    };
++
++    mutable std::atomic<uint32_t>     m_narrowState = { NarrowNone };
++    mutable dxvk::mutex               m_narrowMutex;
++    DxvkImageCreateInfo               m_imageInfo;
++    VkMemoryPropertyFlags             m_memoryProperties = 0;
++    DXGI_VK_FORMAT_FAMILY             m_viewFamily;
++    DXGI_VK_FORMAT_FAMILY             m_fullFamily;
++    std::vector<D3D11ImageViewOwner*> m_views;
++    bool                              m_warnedUsedView = false;
++
++    void MarkUsed() const;
++
++    bool CanNarrowFormats(
++      const DxvkImageCreateInfo&  ImageInfo,
++            BOOL                  IsMultiPlane) const;
++
++    bool WidenLocked(
++            VkFormat              Format);
++
++    static bool FamilyHas(
++      const DXGI_VK_FORMAT_FAMILY& Family,
++            VkFormat              Format);
+     
+     MappedBuffer CreateMappedBuffer(
+             UINT                  MipLevel) const;
+diff --git a/src/d3d11/d3d11_view_dsv.cpp b/src/d3d11/d3d11_view_dsv.cpp
+index 59b8e414..cbc50cc4 100644
+--- a/src/d3d11/d3d11_view_dsv.cpp
++++ b/src/d3d11/d3d11_view_dsv.cpp
+@@ -100,7 +100,7 @@ namespace dxvk {
+ 
+     // Create the underlying image view object
+     m_view = pDevice->GetDXVKDevice()->createImageView(
+-      GetCommonTexture(pResource)->GetImage(), viewInfo);
++      GetCommonTexture(pResource)->PeekImage(), viewInfo);
+   }
+   
+   
+diff --git a/src/d3d11/d3d11_view_rtv.cpp b/src/d3d11/d3d11_view_rtv.cpp
+index afe00083..ecc1e132 100644
+--- a/src/d3d11/d3d11_view_rtv.cpp
++++ b/src/d3d11/d3d11_view_rtv.cpp
+@@ -110,13 +110,32 @@ namespace dxvk {
+     m_info.Image.NumLayers = viewInfo.numLayers;
+     
+     // Create the underlying image view object
+-    m_view = pDevice->GetDXVKDevice()->createImageView(texture->GetImage(), viewInfo);
++    m_viewInfo   = viewInfo;
++    m_dxvkDevice = pDevice->GetDXVKDevice();
++    m_texture    = texture;
++    texture->AttachView(this, viewInfo.format);
+   }
+   
+   
+   D3D11RenderTargetView::~D3D11RenderTargetView() {
++    if (m_texture)
++      m_texture->DetachView(this);
++
+     ResourceReleasePrivate(m_resource);
+   }
++
++
++  Rc<DxvkImageView> D3D11RenderTargetView::GetImageView() const {
++    if (m_texture)
++      m_texture->NotifyUse();
++
++    return m_view;
++  }
++
++
++  void D3D11RenderTargetView::CreateImageView(const Rc<DxvkImage>& Image) {
++    m_view = m_dxvkDevice->createImageView(Image, m_viewInfo);
++  }
+   
+   
+   HRESULT STDMETHODCALLTYPE D3D11RenderTargetView::QueryInterface(REFIID riid, void** ppvObject) {
+diff --git a/src/d3d11/d3d11_view_rtv.h b/src/d3d11/d3d11_view_rtv.h
+index 080146ec..f85ef423 100644
+--- a/src/d3d11/d3d11_view_rtv.h
++++ b/src/d3d11/d3d11_view_rtv.h
+@@ -5,6 +5,7 @@
+ #include "../d3d10/d3d10_view_rtv.h"
+ 
+ #include "d3d11_device_child.h"
++#include "d3d11_texture.h"
+ #include "d3d11_view.h"
+ 
+ namespace dxvk {
+@@ -14,7 +15,7 @@ namespace dxvk {
+   /**
+    * \brief Render target view
+    */
+-  class D3D11RenderTargetView : public D3D11DeviceChild<ID3D11RenderTargetView1> {
++  class D3D11RenderTargetView : public D3D11DeviceChild<ID3D11RenderTargetView1>, public D3D11ImageViewOwner {
+     
+   public:
+     
+@@ -47,9 +48,9 @@ namespace dxvk {
+       return type;
+     }
+     
+-    Rc<DxvkImageView> GetImageView() const {
+-      return m_view;
+-    }
++    Rc<DxvkImageView> GetImageView() const;
++
++    void CreateImageView(const Rc<DxvkImage>& Image);
+     
+     VkImageLayout GetRenderLayout() const {
+       return m_view->imageInfo().tiling == VK_IMAGE_TILING_OPTIMAL
+@@ -82,6 +83,9 @@ namespace dxvk {
+     D3D11_RENDER_TARGET_VIEW_DESC1    m_desc;
+     D3D11_VK_VIEW_INFO                m_info;
+     Rc<DxvkImageView>                 m_view;
++    DxvkImageViewCreateInfo           m_viewInfo;
++    Rc<DxvkDevice>                    m_dxvkDevice;
++    D3D11CommonTexture*               m_texture = nullptr;
+     D3D10RenderTargetView             m_d3d10;
+     
+   };
+diff --git a/src/d3d11/d3d11_view_srv.cpp b/src/d3d11/d3d11_view_srv.cpp
+index 1019c7bd..c8803e12 100644
+--- a/src/d3d11/d3d11_view_srv.cpp
++++ b/src/d3d11/d3d11_view_srv.cpp
+@@ -176,16 +176,35 @@ namespace dxvk {
+       m_info.Image.NumLayers = viewInfo.numLayers;
+ 
+       // Create the underlying image view object
+-      m_imageView = pDevice->GetDXVKDevice()->createImageView(texture->GetImage(), viewInfo);
++      m_viewInfo   = viewInfo;
++      m_dxvkDevice = pDevice->GetDXVKDevice();
++      m_texture    = texture;
++      texture->AttachView(this, viewInfo.format);
+     }
+   }
+ 
+ 
+   D3D11ShaderResourceView::~D3D11ShaderResourceView() {
++    if (m_texture)
++      m_texture->DetachView(this);
++
+     ResourceReleasePrivate(m_resource);
+   }
+ 
+ 
++  Rc<DxvkImageView> D3D11ShaderResourceView::GetImageView() const {
++    if (m_texture)
++      m_texture->NotifyUse();
++
++    return m_imageView;
++  }
++
++
++  void D3D11ShaderResourceView::CreateImageView(const Rc<DxvkImage>& Image) {
++    m_imageView = m_dxvkDevice->createImageView(Image, m_viewInfo);
++  }
++
++
+   HRESULT STDMETHODCALLTYPE D3D11ShaderResourceView::QueryInterface(REFIID riid, void** ppvObject) {
+     if (ppvObject == nullptr)
+       return E_POINTER;
+diff --git a/src/d3d11/d3d11_view_srv.h b/src/d3d11/d3d11_view_srv.h
+index e7c5872e..11d7e219 100644
+--- a/src/d3d11/d3d11_view_srv.h
++++ b/src/d3d11/d3d11_view_srv.h
+@@ -5,6 +5,7 @@
+ #include "../d3d10/d3d10_view_srv.h"
+ 
+ #include "d3d11_device_child.h"
++#include "d3d11_texture.h"
+ #include "d3d11_view.h"
+ 
+ namespace dxvk {
+@@ -14,7 +15,7 @@ namespace dxvk {
+   /**
+    * \brief Shader resource view
+    */
+-  class D3D11ShaderResourceView : public D3D11DeviceChild<ID3D11ShaderResourceView1> {
++  class D3D11ShaderResourceView : public D3D11DeviceChild<ID3D11ShaderResourceView1>, public D3D11ImageViewOwner {
+     
+   public:
+     
+@@ -57,9 +58,9 @@ namespace dxvk {
+       return m_bufferView;
+     }
+     
+-    Rc<DxvkImageView> GetImageView() const {
+-      return m_imageView;
+-    }
++    Rc<DxvkImageView> GetImageView() const;
++
++    void CreateImageView(const Rc<DxvkImage>& Image);
+ 
+     D3D10ShaderResourceView* GetD3D10Iface() {
+       return &m_d3d10;
+@@ -87,6 +88,9 @@ namespace dxvk {
+     D3D11_VK_VIEW_INFO                m_info;
+     Rc<DxvkBufferView>                m_bufferView;
+     Rc<DxvkImageView>                 m_imageView;
++    DxvkImageViewCreateInfo           m_viewInfo;
++    Rc<DxvkDevice>                    m_dxvkDevice;
++    D3D11CommonTexture*               m_texture = nullptr;
+     D3D10ShaderResourceView           m_d3d10;
+ 
+   };
+diff --git a/src/d3d11/d3d11_view_uav.cpp b/src/d3d11/d3d11_view_uav.cpp
+index 1c176871..bb706d0e 100644
+--- a/src/d3d11/d3d11_view_uav.cpp
++++ b/src/d3d11/d3d11_view_uav.cpp
+@@ -120,7 +120,7 @@ namespace dxvk {
+       m_info.Image.NumLayers = viewInfo.numLayers;
+ 
+       m_imageView = pDevice->GetDXVKDevice()->createImageView(
+-        GetCommonTexture(pResource)->GetImage(), viewInfo);
++        GetCommonTexture(pResource)->PeekImage(), viewInfo);
+     }
+   }
+ 
+-- 
+2.56.1
+

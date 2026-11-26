@@ -2,4 +2,5 @@
 # tag already released here produces. The next Sync then releases the newest tag again, as
 # <tag>-armv8-r<revision> (scripts/release-tag.sh; revision 1 is plain <tag>-armv8).
 # 2: DXVK-Sarek's DXGI makes swap chains for vkd3d-proton (patches/extras/dxvk-sarek/0001).
-2
+# 3: DXVK-Sarek narrows typeless colour textures to their UNORM view formats (0002).
+3
